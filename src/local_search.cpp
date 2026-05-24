@@ -26,14 +26,11 @@
 #include <message_filters/subscriber.h>
 #include <message_filters/sync_policies/approximate_time.h>
 #include <message_filters/synchronizer.h>
+#include <nav_msgs/msg/odometry.hpp>
 #include <opencv2/imgproc.hpp>
-#include <pcl/common/centroid.h>
 #include <pcl/common/common.h>
-#include <pcl/common/point_tests.h>
-#include <pcl/kdtree/kdtree.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
-#include <pcl/segmentation/extract_clusters.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
@@ -49,6 +46,10 @@
 #include <visualization_msgs/msg/marker.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 
+#include "get_seg_3d_coord/cluster_extractor.hpp"
+#include "get_seg_3d_coord/local_search_types.hpp"
+#include "get_seg_3d_coord/point_selector.hpp"
+#include "get_seg_3d_coord/state_odometry.hpp"
 #include "inha_interfaces/action/local_search.hpp"
 
 class LocalSearchActionServer : public rclcpp::Node {
@@ -67,6 +68,8 @@ public:
         "camera_info_topic", "/camera/camera_head/color/camera_info");
     bbox_topic_ = this->declare_parameter<std::string>(
         "bbox_topic", "/detection/bbox_stream");
+    odom_topic_ =
+        this->declare_parameter<std::string>("odom_topic", "/odom");
     filtered_cloud_topic_ = this->declare_parameter<std::string>(
         "filtered_cloud_topic", "~/points");
     centers_topic_ = this->declare_parameter<std::string>(
@@ -91,6 +94,17 @@ public:
     input_sync_slop_sec_ =
         this->declare_parameter<double>("input_sync_slop_sec", 0.2);
     tf_timeout_sec_ = this->declare_parameter<double>("tf_timeout_sec", 0.5);
+    require_stable_odom_ =
+        this->declare_parameter<bool>("require_stable_odom", false);
+    odom_stable_window_sec_ =
+        this->declare_parameter<double>("odom_stable_window_sec", 0.3);
+    odom_stable_timeout_sec_ =
+        this->declare_parameter<double>("odom_stable_timeout_sec", 1.0);
+    max_relative_angular_velocity_rad_s_ =
+        this->declare_parameter<double>("max_relative_angular_velocity_rad_s",
+                                        0.20);
+    odom_buffer_size_ =
+        this->declare_parameter<int>("odom_buffer_size", 200);
     prefilter_cloud_ =
         this->declare_parameter<bool>("prefilter_cloud", false);
     prefilter_frame_ =
@@ -119,6 +133,13 @@ public:
     accumulate_timeout_sec_ = std::max(0.1, accumulate_timeout_sec_);
     input_sync_queue_size_ = std::max(1, input_sync_queue_size_);
     input_sync_slop_sec_ = std::max(0.0, input_sync_slop_sec_);
+    odom_stable_window_sec_ = std::max(0.01, odom_stable_window_sec_);
+    odom_stable_timeout_sec_ = std::max(0.01, odom_stable_timeout_sec_);
+    max_relative_angular_velocity_rad_s_ =
+        std::max(0.0, max_relative_angular_velocity_rad_s_);
+    odom_buffer_size_ = std::max(2, odom_buffer_size_);
+    state_odometry_.setMaxBufferSize(
+        static_cast<std::size_t>(odom_buffer_size_));
     if (prefilter_x_min_ > prefilter_x_max_) {
       std::swap(prefilter_x_min_, prefilter_x_max_);
     }
@@ -150,6 +171,10 @@ public:
         pointcloud_topic_, best_effort_qos,
         std::bind(&LocalSearchActionServer::cloudCallback, this,
                   std::placeholders::_1));
+    odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
+        odom_topic_, reliable_qos,
+        std::bind(&LocalSearchActionServer::odomCallback, this,
+                  std::placeholders::_1));
 
     filtered_cloud_pub_ =
         this->create_publisher<sensor_msgs::msg::PointCloud2>(
@@ -173,44 +198,28 @@ public:
 
     RCLCPP_INFO(this->get_logger(),
                 "LocalSearch action node started. action=%s, mask=%s, "
-                "cloud=%s, camera_info=%s, bbox=%s, accumulate_frames=%d",
+                "cloud=%s, camera_info=%s, bbox=%s, odom=%s, "
+                "accumulate_frames=%d, require_stable_odom=%s",
                 action_name_.c_str(), mask_topic_.c_str(),
                 pointcloud_topic_.c_str(), camera_info_topic_.c_str(),
-                bbox_topic_.c_str(), accumulate_frames_);
+                bbox_topic_.c_str(), odom_topic_.c_str(), accumulate_frames_,
+                require_stable_odom_ ? "true" : "false");
   }
 
 private:
   using MaskMsg = sensor_msgs::msg::CompressedImage;
   using PointCloud2Msg = sensor_msgs::msg::PointCloud2;
   using DetectionArrayMsg = vision_msgs::msg::Detection2DArray;
+  using BBoxCandidate = get_seg_3d_coord::BBoxCandidate;
+  using ClusterResult = get_seg_3d_coord::ClusterResult;
+  using PointSelectionConfig = get_seg_3d_coord::PointSelectionConfig;
+  using PointSelectionStats = get_seg_3d_coord::PointSelectionStats;
+  using StateOdometry = get_seg_3d_coord::StateOdometry;
+  using SyncedInput = get_seg_3d_coord::SyncedInput;
   using InputSyncPolicy =
       message_filters::sync_policies::ApproximateTime<MaskMsg,
                                                        DetectionArrayMsg>;
   using InputSynchronizer = message_filters::Synchronizer<InputSyncPolicy>;
-
-  struct BBoxCandidate {
-    std::string class_id;
-    float score{0.0F};
-    float u_min{0.0F};
-    float u_max{0.0F};
-    float v_min{0.0F};
-    float v_max{0.0F};
-  };
-
-  struct ClusterResult {
-    std::size_t bbox_index{0};
-    std::string class_id;
-    float score{0.0F};
-    Eigen::Vector3f center_lidar{Eigen::Vector3f::Zero()};
-    Eigen::Vector3f center_map{Eigen::Vector3f::Zero()};
-    pcl::PointIndices indices;
-  };
-
-  struct SyncedInput {
-    cv::Mat mask;
-    std_msgs::msg::Header mask_header;
-    DetectionArrayMsg::ConstSharedPtr bbox_msg;
-  };
 
   rclcpp_action::GoalResponse
   handleGoal(const rclcpp_action::GoalUUID &,
@@ -303,10 +312,28 @@ private:
       bbox_msg = latest_synced_input_.bbox_msg;
     }
 
-    feedback->state = "ACCUMULATE_LIDAR";
+    feedback->state = "WAIT_STABLE_ODOM";
     goal_handle->publish_feedback(feedback);
 
-    const rclcpp::Time accumulation_start_stamp = this->now();
+    const rclcpp::Time projection_stamp(mask_header.stamp);
+    if (require_stable_odom_ &&
+        !waitForStableOdom(goal_handle, projection_stamp)) {
+      if (goal_handle->is_canceling()) {
+        goal_running_ = false;
+        result->success = false;
+        result->message = "canceled";
+        goal_handle->canceled(result);
+      } else {
+        abortGoal(goal_handle, result,
+                  "odom was not stable around mask timestamp");
+      }
+      return;
+    }
+
+    feedback->state = "COLLECT_SUBMAP";
+    goal_handle->publish_feedback(feedback);
+
+    const rclcpp::Time collection_start_stamp = this->now();
     std::vector<PointCloud2Msg::ConstSharedPtr> collected_clouds;
     collected_clouds.reserve(accumulate_frames_);
     {
@@ -321,7 +348,7 @@ private:
           auto cm = cloud_queue_.front();
           cloud_queue_.pop_front();
           const rclcpp::Time cstamp(cm->header.stamp);
-          if (cstamp >= accumulation_start_stamp) {
+          if (cstamp >= collection_start_stamp) {
             collected_clouds.push_back(cm);
           }
           continue;
@@ -353,9 +380,13 @@ private:
 
     auto accumulated_cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
     std::vector<int> per_point_bbox;
+    PointSelectionStats selection_stats;
+    const PointSelectionConfig selection_config = makePointSelectionConfig();
     for (const auto &cm : collected_clouds) {
-      collectFromOneFrame(cm, camera_info, mask, candidates,
-                          accumulated_cloud, per_point_bbox);
+      get_seg_3d_coord::collectMaskProjectedPoints(
+          cm, camera_info, mask, candidates, projection_stamp,
+          selection_config, tf_buffer_, this->get_logger(), *this->get_clock(),
+          accumulated_cloud, per_point_bbox, &selection_stats);
     }
     accumulated_cloud->width =
         static_cast<std::uint32_t>(accumulated_cloud->points.size());
@@ -363,10 +394,12 @@ private:
     accumulated_cloud->is_dense = false;
 
     std::vector<ClusterResult> clusters =
-        clusterPerBBox(accumulated_cloud, per_point_bbox, candidates);
+        get_seg_3d_coord::clusterPerBBox(
+            accumulated_cloud, per_point_bbox, candidates, cluster_tolerance_,
+            min_cluster_size_, max_cluster_size_, this->get_logger());
 
     std_msgs::msg::Header output_header;
-    output_header.stamp = collected_clouds.back()->header.stamp;
+    output_header.stamp = projection_stamp;
     output_header.frame_id = map_frame_;
 
     for (auto &c : clusters) {
@@ -545,6 +578,57 @@ private:
     data_cv_.notify_all();
   }
 
+  void odomCallback(const nav_msgs::msg::Odometry::ConstSharedPtr msg) {
+    {
+      std::lock_guard<std::mutex> lock(data_mutex_);
+      state_odometry_.push(msg);
+    }
+    data_cv_.notify_all();
+  }
+
+  bool waitForStableOdom(const std::shared_ptr<GoalHandle> &goal_handle,
+                         const rclcpp::Time &stamp) {
+    std::unique_lock<std::mutex> lock(data_mutex_);
+    const auto deadline =
+        std::chrono::steady_clock::now() +
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::duration<double>(odom_stable_timeout_sec_));
+    while (!goal_handle->is_canceling()) {
+      std::string reason;
+      if (state_odometry_.isStableAround(
+              stamp, odom_stable_window_sec_,
+              max_relative_angular_velocity_rad_s_, &reason)) {
+        return true;
+      }
+      RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                            "Waiting stable odom near mask stamp: %s",
+                            reason.c_str());
+      if (data_cv_.wait_until(lock, deadline) == std::cv_status::timeout) {
+        RCLCPP_WARN(this->get_logger(),
+                    "Odom was not stable around mask stamp within %.2fs: %s",
+                    odom_stable_timeout_sec_, reason.c_str());
+        return false;
+      }
+    }
+    return false;
+  }
+
+  PointSelectionConfig makePointSelectionConfig() const {
+    PointSelectionConfig config;
+    config.camera_frame = camera_frame_param_;
+    config.output_frame = map_frame_;
+    config.tf_timeout_sec = tf_timeout_sec_;
+    config.prefilter_cloud = prefilter_cloud_;
+    config.prefilter_frame = prefilter_frame_;
+    config.prefilter_x_min = prefilter_x_min_;
+    config.prefilter_x_max = prefilter_x_max_;
+    config.prefilter_y_min = prefilter_y_min_;
+    config.prefilter_y_max = prefilter_y_max_;
+    config.prefilter_z_min = prefilter_z_min_;
+    config.prefilter_z_max = prefilter_z_max_;
+    return config;
+  }
+
   cv::Mat imageToBinaryMask(const MaskMsg::ConstSharedPtr &mask_msg) {
     cv_bridge::CvImagePtr cv_ptr;
     try {
@@ -580,260 +664,6 @@ private:
     cv::Mat binary;
     cv::threshold(gray_u8, binary, mask_threshold_, 255, cv::THRESH_BINARY);
     return binary;
-  }
-
-  void collectFromOneFrame(
-      const PointCloud2Msg::ConstSharedPtr &cloud_msg,
-      const sensor_msgs::msg::CameraInfo::SharedPtr &camera_info,
-      const cv::Mat &mask,
-      const std::vector<BBoxCandidate> &candidates,
-      pcl::PointCloud<pcl::PointXYZ>::Ptr &accumulated_cloud,
-      std::vector<int> &per_point_bbox) {
-    auto lidar_cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
-    pcl::fromROSMsg(*cloud_msg, *lidar_cloud);
-    if (lidar_cloud->empty()) {
-      return;
-    }
-
-    const std::string camera_frame =
-        camera_frame_param_.empty() ? camera_info->header.frame_id
-                                    : camera_frame_param_;
-    if (camera_frame.empty()) {
-      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                           "Camera frame is empty.");
-      return;
-    }
-
-    const rclcpp::Time frame_stamp(cloud_msg->header.stamp);
-    geometry_msgs::msg::TransformStamped transform;
-    try {
-      transform = tf_buffer_.lookupTransform(
-          camera_frame, cloud_msg->header.frame_id, frame_stamp,
-          rclcpp::Duration::from_seconds(tf_timeout_sec_));
-    } catch (const tf2::TransformException &ex) {
-      RCLCPP_WARN_THROTTLE(
-          this->get_logger(), *this->get_clock(), 2000,
-          "Cannot transform cloud frame '%s' to camera frame '%s': %s",
-          cloud_msg->header.frame_id.c_str(), camera_frame.c_str(), ex.what());
-      return;
-    }
-
-    const std::string output_frame = map_frame_;
-    if (accumulated_cloud->header.frame_id.empty()) {
-      accumulated_cloud->header.frame_id = output_frame;
-    }
-    Eigen::Isometry3f lidar_to_output = Eigen::Isometry3f::Identity();
-    if (output_frame != cloud_msg->header.frame_id) {
-      try {
-        const auto out_tf = tf_buffer_.lookupTransform(
-            output_frame, cloud_msg->header.frame_id, frame_stamp,
-            rclcpp::Duration::from_seconds(tf_timeout_sec_));
-        lidar_to_output = transformToEigen(out_tf.transform);
-      } catch (const tf2::TransformException &ex) {
-        RCLCPP_WARN_THROTTLE(
-            this->get_logger(), *this->get_clock(), 2000,
-            "Cannot transform cloud frame '%s' to output frame '%s': %s",
-            cloud_msg->header.frame_id.c_str(), output_frame.c_str(),
-            ex.what());
-        return;
-      }
-    }
-
-    const Eigen::Isometry3f lidar_to_camera =
-        transformToEigen(transform.transform);
-    Eigen::Isometry3f lidar_to_prefilter = Eigen::Isometry3f::Identity();
-    bool use_prefilter = false;
-    if (prefilter_cloud_ && !prefilter_frame_.empty()) {
-      try {
-        const auto prefilter_tf = tf_buffer_.lookupTransform(
-            prefilter_frame_, cloud_msg->header.frame_id, frame_stamp,
-            rclcpp::Duration::from_seconds(tf_timeout_sec_));
-        lidar_to_prefilter = transformToEigen(prefilter_tf.transform);
-        use_prefilter = true;
-      } catch (const tf2::TransformException &ex) {
-        RCLCPP_WARN_THROTTLE(
-            this->get_logger(), *this->get_clock(), 2000,
-            "Cannot transform cloud frame '%s' to prefilter frame '%s'; "
-            "continuing without cloud prefilter: %s",
-            cloud_msg->header.frame_id.c_str(), prefilter_frame_.c_str(),
-            ex.what());
-      }
-    }
-
-    const double fx = camera_info->k[0];
-    const double fy = camera_info->k[4];
-    const double cx = camera_info->k[2];
-    const double cy = camera_info->k[5];
-    const double x_scale =
-        camera_info->width > 0
-            ? static_cast<double>(mask.cols) /
-                  static_cast<double>(camera_info->width)
-            : 1.0;
-    const double y_scale =
-        camera_info->height > 0
-            ? static_cast<double>(mask.rows) /
-                  static_cast<double>(camera_info->height)
-            : 1.0;
-
-    std::size_t finite_points = 0;
-    std::size_t prefiltered_points = 0;
-    std::size_t projected_mask_points = 0;
-    for (const auto &point : lidar_cloud->points) {
-      if (!pcl::isFinite(point)) {
-        continue;
-      }
-      ++finite_points;
-      const Eigen::Vector3f lidar_point(point.x, point.y, point.z);
-      if (use_prefilter) {
-        const Eigen::Vector3f prefilter_point =
-            lidar_to_prefilter * lidar_point;
-        if (prefilter_point.x() < prefilter_x_min_ ||
-            prefilter_point.x() > prefilter_x_max_ ||
-            prefilter_point.y() < prefilter_y_min_ ||
-            prefilter_point.y() > prefilter_y_max_ ||
-            prefilter_point.z() < prefilter_z_min_ ||
-            prefilter_point.z() > prefilter_z_max_) {
-          continue;
-        }
-      }
-      ++prefiltered_points;
-      const Eigen::Vector3f camera_point = lidar_to_camera * lidar_point;
-      if (camera_point.z() <= 0.0F) {
-        continue;
-      }
-
-      const double u_orig = fx * camera_point.x() / camera_point.z() + cx;
-      const double v_orig = fy * camera_point.y() / camera_point.z() + cy;
-
-      int best_bbox = -1;
-      float best_area = std::numeric_limits<float>::infinity();
-      for (std::size_t b = 0; b < candidates.size(); ++b) {
-        const auto &c = candidates[b];
-        if (u_orig < c.u_min || u_orig > c.u_max || v_orig < c.v_min ||
-            v_orig > c.v_max) {
-          continue;
-        }
-        const float area =
-            (c.u_max - c.u_min) * (c.v_max - c.v_min);
-        if (area < best_area) {
-          best_area = area;
-          best_bbox = static_cast<int>(b);
-        }
-      }
-      if (best_bbox < 0) {
-        continue;
-      }
-
-      const int u_mask = static_cast<int>(std::lround(u_orig * x_scale));
-      const int v_mask = static_cast<int>(std::lround(v_orig * y_scale));
-      if (u_mask < 0 || u_mask >= mask.cols || v_mask < 0 ||
-          v_mask >= mask.rows) {
-        continue;
-      }
-      if (mask.at<unsigned char>(v_mask, u_mask) == 0) {
-        continue;
-      }
-      ++projected_mask_points;
-
-      const Eigen::Vector3f output_point = lidar_to_output * lidar_point;
-      pcl::PointXYZ out;
-      out.x = output_point.x();
-      out.y = output_point.y();
-      out.z = output_point.z();
-      accumulated_cloud->points.push_back(out);
-      per_point_bbox.push_back(best_bbox);
-    }
-
-    RCLCPP_INFO(this->get_logger(),
-                "local_search cloud frame: raw=%zu finite=%zu prefiltered=%zu "
-                "bbox_mask=%zu cumulative=%zu",
-                lidar_cloud->points.size(), finite_points, prefiltered_points,
-                projected_mask_points, accumulated_cloud->points.size());
-  }
-
-  std::vector<ClusterResult> clusterPerBBox(
-      const pcl::PointCloud<pcl::PointXYZ>::Ptr &accumulated_cloud,
-      const std::vector<int> &per_point_bbox,
-      const std::vector<BBoxCandidate> &candidates) const {
-    std::vector<ClusterResult> results;
-    if (candidates.empty() || accumulated_cloud->points.empty()) {
-      return results;
-    }
-
-    std::vector<std::vector<int>> bins(candidates.size());
-    for (std::size_t i = 0; i < per_point_bbox.size(); ++i) {
-      bins[per_point_bbox[i]].push_back(static_cast<int>(i));
-    }
-
-    for (std::size_t b = 0; b < candidates.size(); ++b) {
-      const auto &indices = bins[b];
-      if (static_cast<int>(indices.size()) < min_cluster_size_) {
-        RCLCPP_WARN(this->get_logger(),
-                    "local_search bbox[%zu] class=%s skipped: points=%zu < "
-                    "min_cluster_size=%d",
-                    b, candidates[b].class_id.c_str(), indices.size(),
-                    min_cluster_size_);
-        continue;
-      }
-
-      auto sub_cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
-      sub_cloud->points.reserve(indices.size());
-      for (int idx : indices) {
-        sub_cloud->points.push_back(accumulated_cloud->points[idx]);
-      }
-      sub_cloud->width = static_cast<std::uint32_t>(sub_cloud->points.size());
-      sub_cloud->height = 1;
-      sub_cloud->is_dense = false;
-
-      auto tree = std::make_shared<pcl::search::KdTree<pcl::PointXYZ>>();
-      tree->setInputCloud(sub_cloud);
-
-      std::vector<pcl::PointIndices> cluster_indices;
-      pcl::EuclideanClusterExtraction<pcl::PointXYZ> extractor;
-      extractor.setClusterTolerance(cluster_tolerance_);
-      extractor.setMinClusterSize(min_cluster_size_);
-      extractor.setMaxClusterSize(max_cluster_size_);
-      extractor.setSearchMethod(tree);
-      extractor.setInputCloud(sub_cloud);
-      extractor.extract(cluster_indices);
-
-      ClusterResult cr;
-      cr.bbox_index = b;
-      cr.class_id = candidates[b].class_id;
-      cr.score = candidates[b].score;
-
-      if (cluster_indices.empty()) {
-        RCLCPP_WARN(this->get_logger(),
-                    "local_search bbox[%zu] class=%s PCL clustering yielded 0 "
-                    "clusters from %zu points (tol=%.2f); using all points as "
-                    "fallback",
-                    b, candidates[b].class_id.c_str(), indices.size(),
-                    cluster_tolerance_);
-        cr.indices.indices = indices;
-      } else {
-        std::size_t dominant = 0;
-        for (std::size_t k = 1; k < cluster_indices.size(); ++k) {
-          if (cluster_indices[k].indices.size() >
-              cluster_indices[dominant].indices.size()) {
-            dominant = k;
-          }
-        }
-        cr.indices.indices.reserve(cluster_indices[dominant].indices.size());
-        for (int sub_idx : cluster_indices[dominant].indices) {
-          cr.indices.indices.push_back(indices[sub_idx]);
-        }
-        RCLCPP_INFO(this->get_logger(),
-                    "local_search bbox[%zu] class=%s clusters=%zu dominant=%zu",
-                    b, candidates[b].class_id.c_str(), cluster_indices.size(),
-                    cluster_indices[dominant].indices.size());
-      }
-
-      Eigen::Vector4f centroid;
-      pcl::compute3DCentroid(*accumulated_cloud, cr.indices.indices, centroid);
-      cr.center_lidar = Eigen::Vector3f(centroid.x(), centroid.y(), centroid.z());
-      results.push_back(std::move(cr));
-    }
-    return results;
   }
 
   void publishFilteredCloud(
@@ -970,24 +800,11 @@ private:
     markers_pub_->publish(marker_array);
   }
 
-  Eigen::Isometry3f
-  transformToEigen(const geometry_msgs::msg::Transform &transform) const {
-    Eigen::Isometry3f eigen_transform = Eigen::Isometry3f::Identity();
-    eigen_transform.translation() =
-        Eigen::Vector3f(transform.translation.x, transform.translation.y,
-                        transform.translation.z);
-
-    const Eigen::Quaternionf rotation(
-        transform.rotation.w, transform.rotation.x, transform.rotation.y,
-        transform.rotation.z);
-    eigen_transform.linear() = rotation.normalized().toRotationMatrix();
-    return eigen_transform;
-  }
-
   std::string mask_topic_;
   std::string pointcloud_topic_;
   std::string camera_info_topic_;
   std::string bbox_topic_;
+  std::string odom_topic_;
   std::string filtered_cloud_topic_;
   std::string centers_topic_;
   std::string clustered_cloud_topic_;
@@ -1002,6 +819,11 @@ private:
   int input_sync_queue_size_{10};
   double input_sync_slop_sec_{0.2};
   double tf_timeout_sec_{0.05};
+  bool require_stable_odom_{false};
+  double odom_stable_window_sec_{0.3};
+  double odom_stable_timeout_sec_{1.0};
+  double max_relative_angular_velocity_rad_s_{0.20};
+  int odom_buffer_size_{200};
   bool prefilter_cloud_{false};
   std::string prefilter_frame_{"base"};
   double prefilter_x_min_{0.0};
@@ -1022,6 +844,7 @@ private:
   SyncedInput latest_synced_input_;
   sensor_msgs::msg::CameraInfo::SharedPtr camera_info_;
   std::deque<PointCloud2Msg::ConstSharedPtr> cloud_queue_;
+  StateOdometry state_odometry_;
 
   message_filters::Subscriber<MaskMsg> mask_sub_;
   message_filters::Subscriber<DetectionArrayMsg> bbox_sub_;
@@ -1029,6 +852,7 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr
       camera_info_sub_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Publisher<PointCloud2Msg>::SharedPtr filtered_cloud_pub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr centers_pub_;
   rclcpp::Publisher<PointCloud2Msg>::SharedPtr clustered_cloud_pub_;

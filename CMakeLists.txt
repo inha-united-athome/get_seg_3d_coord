@@ -10,6 +10,7 @@ find_package(cv_bridge REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(message_filters REQUIRED)
+find_package(nav_msgs REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(PCL REQUIRED COMPONENTS common io segmentation search kdtree)
 find_package(pcl_conversions REQUIRED)
@@ -30,6 +31,9 @@ add_executable(table_person_association
 
 add_executable(local_search
   src/local_search.cpp
+  src/cluster_extractor.cpp
+  src/point_selector.cpp
+  src/state_odometry.cpp
 )
 
 target_include_directories(table_person_association
@@ -92,6 +96,7 @@ ament_target_dependencies(local_search
   cv_bridge
   geometry_msgs
   message_filters
+  nav_msgs
   pcl_conversions
   rclcpp
   rclcpp_action

@@ -26,6 +26,7 @@ local_search:
     pointcloud_topic: "/livox/lidar"
     camera_info_topic: "/camera/camera_head/color/camera_info"
     bbox_topic: "/detection/bbox_stream"
+    odom_topic: "/odom"
     filtered_cloud_topic: "~/points"
     centers_topic: "~/cluster_centers"
     clustered_cloud_topic: "~/clustered_points"
@@ -40,6 +41,11 @@ local_search:
     input_sync_queue_size: 10
     input_sync_slop_sec: 0.2
     tf_timeout_sec: 0.2
+    require_stable_odom: true
+    odom_stable_window_sec: 0.3
+    odom_stable_timeout_sec: 1.0
+    max_relative_angular_velocity_rad_s: 0.20
+    odom_buffer_size: 200
     prefilter_cloud: true
     prefilter_frame: "base"
     prefilter_x_min: 0.5
