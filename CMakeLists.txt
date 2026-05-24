@@ -33,6 +33,7 @@ add_executable(local_search
   src/local_search.cpp
   src/cluster_extractor.cpp
   src/point_selector.cpp
+  src/position_ekf.cpp
   src/state_odometry.cpp
 )
 

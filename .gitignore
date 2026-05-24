@@ -2,4 +2,5 @@ build/
 install/
 log/
 .claude/
+EKF_results/
 .codex

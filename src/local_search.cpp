@@ -5,11 +5,15 @@
 #include <cstdint>
 #include <cstdio>
 #include <deque>
+#include <filesystem>
+#include <fstream>
 #include <functional>
+#include <iomanip>
 #include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -49,6 +53,7 @@
 #include "get_seg_3d_coord/cluster_extractor.hpp"
 #include "get_seg_3d_coord/local_search_types.hpp"
 #include "get_seg_3d_coord/point_selector.hpp"
+#include "get_seg_3d_coord/position_ekf.hpp"
 #include "get_seg_3d_coord/state_odometry.hpp"
 #include "inha_interfaces/action/local_search.hpp"
 
@@ -63,7 +68,7 @@ public:
     mask_topic_ = this->declare_parameter<std::string>(
         "mask_topic", "/sam2_segmentation_node/binary_mask/compressed");
     pointcloud_topic_ = this->declare_parameter<std::string>(
-        "pointcloud_topic", "/livox/lidar");
+        "pointcloud_topic", "/approach/submap_cloud");
     camera_info_topic_ = this->declare_parameter<std::string>(
         "camera_info_topic", "/camera/camera_head/color/camera_info");
     bbox_topic_ = this->declare_parameter<std::string>(
@@ -121,16 +126,34 @@ public:
         this->declare_parameter<double>("prefilter_z_min", -0.05);
     prefilter_z_max_ =
         this->declare_parameter<double>("prefilter_z_max", 2.0);
-    accumulate_frames_ =
-        this->declare_parameter<int>("accumulate_frames", 10);
-    accumulate_timeout_sec_ =
-        this->declare_parameter<double>("accumulate_timeout_sec", 3.0);
+    submap_timeout_sec_ =
+        this->declare_parameter<double>("submap_timeout_sec", 3.0);
     max_distance_from_reference_m_ = this->declare_parameter<double>(
         "max_distance_from_reference_m", 1.5);
+    ekf_enabled_ = this->declare_parameter<bool>("ekf_enabled", true);
+    ekf_timeout_sec_ =
+        this->declare_parameter<double>("ekf_timeout_sec", 10.0);
+    ekf_converged_variance_ =
+        this->declare_parameter<double>("ekf_converged_variance", 0.01);
+    ekf_initial_variance_ =
+        this->declare_parameter<double>("ekf_initial_variance", 1.0);
+    ekf_measurement_variance_ =
+        this->declare_parameter<double>("ekf_measurement_variance", 0.09);
+    ekf_process_variance_per_sec_ = this->declare_parameter<double>(
+        "ekf_process_variance_per_sec", 0.0025);
+    ekf_log_enabled_ =
+        this->declare_parameter<bool>("ekf_log_enabled", true);
+    ekf_log_dir_ =
+        this->declare_parameter<std::string>("ekf_log_dir", "EKF_results");
     max_distance_from_reference_m_ =
         std::max(0.0, max_distance_from_reference_m_);
-    accumulate_frames_ = std::max(1, accumulate_frames_);
-    accumulate_timeout_sec_ = std::max(0.1, accumulate_timeout_sec_);
+    ekf_timeout_sec_ = std::max(0.1, ekf_timeout_sec_);
+    ekf_converged_variance_ = std::max(1e-6, ekf_converged_variance_);
+    ekf_initial_variance_ = std::max(1e-6, ekf_initial_variance_);
+    ekf_measurement_variance_ = std::max(1e-6, ekf_measurement_variance_);
+    ekf_process_variance_per_sec_ =
+        std::max(0.0, ekf_process_variance_per_sec_);
+    submap_timeout_sec_ = std::max(0.1, submap_timeout_sec_);
     input_sync_queue_size_ = std::max(1, input_sync_queue_size_);
     input_sync_slop_sec_ = std::max(0.0, input_sync_slop_sec_);
     odom_stable_window_sec_ = std::max(0.01, odom_stable_window_sec_);
@@ -199,10 +222,10 @@ public:
     RCLCPP_INFO(this->get_logger(),
                 "LocalSearch action node started. action=%s, mask=%s, "
                 "cloud=%s, camera_info=%s, bbox=%s, odom=%s, "
-                "accumulate_frames=%d, require_stable_odom=%s",
+                "submap_timeout=%.2fs, require_stable_odom=%s",
                 action_name_.c_str(), mask_topic_.c_str(),
                 pointcloud_topic_.c_str(), camera_info_topic_.c_str(),
-                bbox_topic_.c_str(), odom_topic_.c_str(), accumulate_frames_,
+                bbox_topic_.c_str(), odom_topic_.c_str(), submap_timeout_sec_,
                 require_stable_odom_ ? "true" : "false");
   }
 
@@ -214,12 +237,21 @@ private:
   using ClusterResult = get_seg_3d_coord::ClusterResult;
   using PointSelectionConfig = get_seg_3d_coord::PointSelectionConfig;
   using PointSelectionStats = get_seg_3d_coord::PointSelectionStats;
+  using PositionEkf = get_seg_3d_coord::PositionEkf;
   using StateOdometry = get_seg_3d_coord::StateOdometry;
   using SyncedInput = get_seg_3d_coord::SyncedInput;
   using InputSyncPolicy =
       message_filters::sync_policies::ApproximateTime<MaskMsg,
                                                        DetectionArrayMsg>;
   using InputSynchronizer = message_filters::Synchronizer<InputSyncPolicy>;
+
+  struct MeasurementBatch {
+    std::vector<Eigen::Vector3f> positions;
+    std::vector<bool> found;
+    std::size_t cluster_count{0};
+    std::size_t point_count{0};
+    std::string diagnostics;
+  };
 
   rclcpp_action::GoalResponse
   handleGoal(const rclcpp_action::GoalUUID &,
@@ -262,100 +294,96 @@ private:
     auto result = std::make_shared<LocalSearch::Result>();
     auto feedback = std::make_shared<LocalSearch::Feedback>();
 
-    feedback->state = "WAIT_INPUTS";
-    feedback->current_num = 0;
-    goal_handle->publish_feedback(feedback);
-
     const auto requested_classes = std::vector<std::string>(
         goal->class_names.begin(), goal->class_names.end());
     const rclcpp::Time goal_start_stamp = this->now();
+    const Eigen::Vector3f reference(static_cast<float>(goal->reference_position.x),
+                                    static_cast<float>(goal->reference_position.y),
+                                    static_cast<float>(goal->reference_position.z));
+    const double effective_max_distance =
+        goal->max_distance > 0.0F
+            ? static_cast<double>(goal->max_distance)
+            : max_distance_from_reference_m_;
 
-    cv::Mat mask;
-    std_msgs::msg::Header mask_header;
-    sensor_msgs::msg::CameraInfo::SharedPtr camera_info;
-    DetectionArrayMsg::ConstSharedPtr bbox_msg;
+    std::vector<PositionEkf> filters(requested_classes.size());
+    std::vector<bool> ever_found(requested_classes.size(), false);
+    std::vector<rclcpp::Time> last_update(requested_classes.size(),
+                                          goal_start_stamp);
+    std::ofstream ekf_log = openEkfLog(goal_start_stamp, requested_classes);
+    std::size_t total_measurements = 0;
+    std::size_t last_cluster_count = 0;
+    std::size_t last_point_count = 0;
+    std::string last_diag;
+    bool ekf_converged = false;
+    rclcpp::Time min_input_stamp = goal_start_stamp;
+    const auto ekf_deadline =
+        std::chrono::steady_clock::now() +
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::duration<double>(ekf_enabled_ ? ekf_timeout_sec_
+                                                       : submap_timeout_sec_));
 
-    {
-      std::unique_lock<std::mutex> lock(data_mutex_);
-      data_cv_.wait(
-          lock,
-          [this, &goal_handle, &goal_start_stamp, &requested_classes]() {
-            if (goal_handle->is_canceling()) return true;
-            if (!has_synced_input_ || camera_info_ == nullptr) return false;
-            const auto &bm = latest_synced_input_.bbox_msg;
-            if (!bm) return false;
-            const rclcpp::Time bbox_stamp(bm->header.stamp);
-            if (bbox_stamp < goal_start_stamp) return false;
-            for (const auto &det : bm->detections) {
-              if (det.results.empty()) continue;
-              const auto &cid = det.results.front().hypothesis.class_id;
-              if (std::find(requested_classes.begin(),
-                            requested_classes.end(),
-                            cid) != requested_classes.end()) {
-                return true;
-              }
-            }
-            return false;
-          });
+    while (!goal_handle->is_canceling()) {
+      feedback->state = ekf_enabled_ ? "EKF_TRACK" : "WAIT_INPUTS";
+      feedback->current_num =
+          static_cast<std::int32_t>(std::count(ever_found.begin(),
+                                               ever_found.end(), true));
+      goal_handle->publish_feedback(feedback);
 
-      if (goal_handle->is_canceling()) {
-        goal_running_ = false;
-        result->success = false;
-        result->message = "canceled";
-        goal_handle->canceled(result);
-        return;
+      MeasurementBatch batch;
+      const bool got_measurement = collectMeasurementBatch(
+          goal_handle, requested_classes, min_input_stamp, reference,
+          effective_max_distance, ekf_deadline, &batch, &min_input_stamp);
+      if (!got_measurement) {
+        break;
       }
 
-      mask = latest_synced_input_.mask.clone();
-      mask_header = latest_synced_input_.mask_header;
-      camera_info = camera_info_;
-      bbox_msg = latest_synced_input_.bbox_msg;
-    }
-
-    feedback->state = "WAIT_STABLE_ODOM";
-    goal_handle->publish_feedback(feedback);
-
-    const rclcpp::Time projection_stamp(mask_header.stamp);
-    if (require_stable_odom_ &&
-        !waitForStableOdom(goal_handle, projection_stamp)) {
-      if (goal_handle->is_canceling()) {
-        goal_running_ = false;
-        result->success = false;
-        result->message = "canceled";
-        goal_handle->canceled(result);
-      } else {
-        abortGoal(goal_handle, result,
-                  "odom was not stable around mask timestamp");
-      }
-      return;
-    }
-
-    feedback->state = "COLLECT_SUBMAP";
-    goal_handle->publish_feedback(feedback);
-
-    const rclcpp::Time collection_start_stamp = this->now();
-    std::vector<PointCloud2Msg::ConstSharedPtr> collected_clouds;
-    collected_clouds.reserve(accumulate_frames_);
-    {
-      std::unique_lock<std::mutex> lock(data_mutex_);
-      const auto deadline =
-          std::chrono::steady_clock::now() +
-          std::chrono::duration_cast<std::chrono::milliseconds>(
-              std::chrono::duration<double>(accumulate_timeout_sec_));
-      while (static_cast<int>(collected_clouds.size()) < accumulate_frames_ &&
-             !goal_handle->is_canceling()) {
-        if (!cloud_queue_.empty()) {
-          auto cm = cloud_queue_.front();
-          cloud_queue_.pop_front();
-          const rclcpp::Time cstamp(cm->header.stamp);
-          if (cstamp >= collection_start_stamp) {
-            collected_clouds.push_back(cm);
-          }
+      last_cluster_count = batch.cluster_count;
+      last_point_count = batch.point_count;
+      last_diag = batch.diagnostics;
+      bool any_update = false;
+      const rclcpp::Time update_stamp = this->now();
+      for (std::size_t i = 0; i < requested_classes.size(); ++i) {
+        if (!batch.found[i]) {
           continue;
         }
-        if (data_cv_.wait_until(lock, deadline) == std::cv_status::timeout) {
+        if (filters[i].initialized()) {
+          const double dt =
+              std::max(0.0, (update_stamp - last_update[i]).seconds());
+          filters[i].predict(dt, ekf_process_variance_per_sec_);
+          const double nis = filters[i].normalizedInnovationSquared(
+              batch.positions[i], ekf_measurement_variance_);
+          writeEkfLog(ekf_log, update_stamp, requested_classes[i],
+                      batch.positions[i], filters[i], nis);
+          filters[i].update(batch.positions[i], ekf_measurement_variance_);
+        } else {
+          filters[i].initialize(batch.positions[i], ekf_initial_variance_);
+          writeEkfLog(ekf_log, update_stamp, requested_classes[i],
+                      batch.positions[i], filters[i], -1.0);
+        }
+        last_update[i] = update_stamp;
+        ever_found[i] = true;
+        any_update = true;
+        ++total_measurements;
+      }
+
+      if (!ekf_enabled_) {
+        break;
+      }
+
+      bool all_converged = true;
+      for (std::size_t i = 0; i < requested_classes.size(); ++i) {
+        if (!filters[i].initialized() ||
+            filters[i].maxVariance() > ekf_converged_variance_) {
+          all_converged = false;
           break;
         }
+      }
+      if (all_converged && any_update) {
+        ekf_converged = true;
+        break;
+      }
+      if (std::chrono::steady_clock::now() >= ekf_deadline) {
+        break;
       }
     }
 
@@ -367,27 +395,212 @@ private:
       return;
     }
 
-    if (collected_clouds.empty()) {
-      abortGoal(goal_handle, result, "no livox frames collected within timeout");
-      return;
+    int found_count = 0;
+    double max_variance = 0.0;
+    result->coords.resize(requested_classes.size());
+    result->found.resize(requested_classes.size());
+    for (std::size_t i = 0; i < requested_classes.size(); ++i) {
+      if (filters[i].initialized()) {
+        const auto &position = filters[i].position();
+        max_variance = std::max(max_variance, filters[i].maxVariance());
+        result->coords[i].x = position.x();
+        result->coords[i].y = position.y();
+        result->coords[i].z = position.z();
+        result->found[i] = true;
+        ++found_count;
+      } else {
+        result->coords[i].x = 0.0;
+        result->coords[i].y = 0.0;
+        result->coords[i].z = 0.0;
+        result->found[i] = false;
+      }
     }
 
-    feedback->state = "CLUSTER";
+    feedback->current_num = static_cast<std::int32_t>(found_count);
     goal_handle->publish_feedback(feedback);
+
+    goal_running_ = false;
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "found %d/%zu classes (measurements=%zu, clusters=%zu, "
+                  "points=%zu, ekf=%s, converged=%s, "
+                  "max_var=%.4f) %s",
+                  found_count, requested_classes.size(), total_measurements,
+                  last_cluster_count, last_point_count, ekf_enabled_ ? "on" : "off",
+                  ekf_converged ? "true" : "false", max_variance,
+                  last_diag.c_str());
+    result->message = buf;
+    result->success = (found_count == static_cast<int>(requested_classes.size()));
+    goal_handle->succeed(result);
+  }
+
+  void abortGoal(const std::shared_ptr<GoalHandle> &goal_handle,
+                 const std::shared_ptr<LocalSearch::Result> &result,
+                 const std::string &message) {
+    goal_running_ = false;
+    result->success = false;
+    result->message = message;
+    goal_handle->abort(result);
+  }
+
+  std::ofstream openEkfLog(
+      const rclcpp::Time &run_stamp,
+      const std::vector<std::string> &requested_classes) const {
+    std::ofstream log;
+    if (!ekf_log_enabled_) {
+      return log;
+    }
+
+    try {
+      std::filesystem::create_directories(ekf_log_dir_);
+      std::ostringstream path;
+      path << ekf_log_dir_ << "/ekf_"
+           << run_stamp.seconds() << ".csv";
+      log.open(path.str(), std::ios::out);
+    } catch (const std::exception &ex) {
+      RCLCPP_WARN(this->get_logger(), "Failed to open EKF log: %s", ex.what());
+      return {};
+    }
+
+    if (!log.is_open()) {
+      RCLCPP_WARN(this->get_logger(), "Failed to open EKF log file.");
+      return {};
+    }
+
+    log << std::setprecision(9);
+    log << "# classes=";
+    for (std::size_t i = 0; i < requested_classes.size(); ++i) {
+      if (i > 0) log << "|";
+      log << requested_classes[i];
+    }
+    log << "\n";
+    log << "# ekf_initial_variance=" << ekf_initial_variance_ << "\n";
+    log << "# ekf_measurement_variance=" << ekf_measurement_variance_
+        << "\n";
+    log << "# ekf_process_variance_per_sec="
+        << ekf_process_variance_per_sec_ << "\n";
+    log << "# ekf_converged_variance=" << ekf_converged_variance_ << "\n";
+    log << "stamp,class,meas_x,meas_y,meas_z,est_x,est_y,est_z,"
+           "cov_x,cov_y,cov_z,nis\n";
+    return log;
+  }
+
+  void writeEkfLog(std::ofstream &log,
+                   const rclcpp::Time &stamp,
+                   const std::string &class_id,
+                   const Eigen::Vector3f &measurement,
+                   const PositionEkf &filter,
+                   double nis) const {
+    if (!log.is_open()) {
+      return;
+    }
+    const auto &position = filter.position();
+    const auto covariance = filter.covariance().diagonal();
+    log << stamp.seconds() << "," << class_id << ","
+        << measurement.x() << "," << measurement.y() << ","
+        << measurement.z() << "," << position.x() << ","
+        << position.y() << "," << position.z() << ","
+        << covariance.x() << "," << covariance.y() << ","
+        << covariance.z() << "," << nis << "\n";
+  }
+
+  bool collectMeasurementBatch(
+      const std::shared_ptr<GoalHandle> &goal_handle,
+      const std::vector<std::string> &requested_classes,
+      const rclcpp::Time &min_input_stamp,
+      const Eigen::Vector3f &reference,
+      double effective_max_distance,
+      const std::chrono::steady_clock::time_point &deadline,
+      MeasurementBatch *batch,
+      rclcpp::Time *next_min_input_stamp) {
+    cv::Mat mask;
+    std_msgs::msg::Header mask_header;
+    sensor_msgs::msg::CameraInfo::SharedPtr camera_info;
+    DetectionArrayMsg::ConstSharedPtr bbox_msg;
+
+    {
+      std::unique_lock<std::mutex> lock(data_mutex_);
+      const bool has_input = data_cv_.wait_until(
+          lock, deadline,
+          [this, &goal_handle, &min_input_stamp, &requested_classes]() {
+            if (goal_handle->is_canceling()) return true;
+            if (!has_synced_input_ || camera_info_ == nullptr) return false;
+            const auto &bm = latest_synced_input_.bbox_msg;
+            if (!bm) return false;
+            const rclcpp::Time bbox_stamp(bm->header.stamp);
+            if (bbox_stamp <= min_input_stamp) return false;
+            for (const auto &det : bm->detections) {
+              if (det.results.empty()) continue;
+              const auto &cid = det.results.front().hypothesis.class_id;
+              if (std::find(requested_classes.begin(),
+                            requested_classes.end(),
+                            cid) != requested_classes.end()) {
+                return true;
+              }
+            }
+            return false;
+          });
+      if (!has_input || goal_handle->is_canceling()) {
+        return false;
+      }
+
+      mask = latest_synced_input_.mask.clone();
+      mask_header = latest_synced_input_.mask_header;
+      camera_info = camera_info_;
+      bbox_msg = latest_synced_input_.bbox_msg;
+    }
+
+    const rclcpp::Time projection_stamp(mask_header.stamp);
+    *next_min_input_stamp = rclcpp::Time(bbox_msg->header.stamp);
+    batch->positions.assign(requested_classes.size(), Eigen::Vector3f::Zero());
+    batch->found.assign(requested_classes.size(), false);
+    if (require_stable_odom_ &&
+        !waitForStableOdom(goal_handle, projection_stamp)) {
+      batch->diagnostics = "[unstable odom]";
+      return true;
+    }
+
+    const rclcpp::Time collection_start_stamp = this->now();
+    PointCloud2Msg::ConstSharedPtr submap_cloud;
+    {
+      std::unique_lock<std::mutex> lock(data_mutex_);
+      auto cloud_deadline =
+          std::chrono::steady_clock::now() +
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::duration<double>(submap_timeout_sec_));
+      if (deadline < cloud_deadline) {
+        cloud_deadline = deadline;
+      }
+      while (!submap_cloud && !goal_handle->is_canceling()) {
+        if (!cloud_queue_.empty()) {
+          auto cm = cloud_queue_.front();
+          cloud_queue_.pop_front();
+          const rclcpp::Time cstamp(cm->header.stamp);
+          if (cstamp >= collection_start_stamp) {
+            submap_cloud = cm;
+          }
+          continue;
+        }
+        if (data_cv_.wait_until(lock, cloud_deadline) ==
+            std::cv_status::timeout) {
+          break;
+        }
+      }
+    }
+    if (goal_handle->is_canceling() || !submap_cloud) {
+      return false;
+    }
 
     const auto candidates =
         buildBBoxCandidates(*bbox_msg, requested_classes, *camera_info, mask);
-
     auto accumulated_cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
     std::vector<int> per_point_bbox;
     PointSelectionStats selection_stats;
     const PointSelectionConfig selection_config = makePointSelectionConfig();
-    for (const auto &cm : collected_clouds) {
-      get_seg_3d_coord::collectMaskProjectedPoints(
-          cm, camera_info, mask, candidates, projection_stamp,
-          selection_config, tf_buffer_, this->get_logger(), *this->get_clock(),
-          accumulated_cloud, per_point_bbox, &selection_stats);
-    }
+    get_seg_3d_coord::collectMaskProjectedPoints(
+        submap_cloud, camera_info, mask, candidates, projection_stamp,
+        selection_config, tf_buffer_, this->get_logger(), *this->get_clock(),
+        accumulated_cloud, per_point_bbox, &selection_stats);
     accumulated_cloud->width =
         static_cast<std::uint32_t>(accumulated_cloud->points.size());
     accumulated_cloud->height = 1;
@@ -411,25 +624,15 @@ private:
     publishCenters(output_header, clusters);
     publishMarkers(output_header, accumulated_cloud, clusters);
 
-    const Eigen::Vector3f reference(static_cast<float>(goal->reference_position.x),
-                                    static_cast<float>(goal->reference_position.y),
-                                    static_cast<float>(goal->reference_position.z));
+    batch->cluster_count = clusters.size();
+    batch->point_count = accumulated_cloud->points.size();
 
-    const double effective_max_distance =
-        goal->max_distance > 0.0F
-            ? static_cast<double>(goal->max_distance)
-            : max_distance_from_reference_m_;
     const float max_dist_sq =
         static_cast<float>(effective_max_distance * effective_max_distance);
-    int found_count = 0;
-    std::string per_class_diag;
-    result->coords.resize(requested_classes.size());
-    result->found.resize(requested_classes.size());
     for (std::size_t i = 0; i < requested_classes.size(); ++i) {
       const auto &name = requested_classes[i];
       float best_dist_sq = std::numeric_limits<float>::infinity();
-      float nearest_rejected_dist =
-          std::numeric_limits<float>::infinity();
+      float nearest_rejected_dist = std::numeric_limits<float>::infinity();
       int matching_class_clusters = 0;
       const ClusterResult *best = nullptr;
       for (const auto &cluster : clusters) {
@@ -447,17 +650,11 @@ private:
           best = &cluster;
         }
       }
+
       if (best) {
-        result->coords[i].x = best->center_map.x();
-        result->coords[i].y = best->center_map.y();
-        result->coords[i].z = best->center_map.z();
-        result->found[i] = true;
-        ++found_count;
+        batch->positions[i] = best->center_map;
+        batch->found[i] = true;
       } else {
-        result->coords[i].x = 0.0;
-        result->coords[i].y = 0.0;
-        result->coords[i].z = 0.0;
-        result->found[i] = false;
         char dbuf[128];
         if (matching_class_clusters == 0) {
           std::snprintf(dbuf, sizeof(dbuf), "[%s: no cluster]", name.c_str());
@@ -468,32 +665,11 @@ private:
                         std::sqrt(nearest_rejected_dist),
                         effective_max_distance);
         }
-        per_class_diag += dbuf;
+        batch->diagnostics += dbuf;
       }
     }
 
-    feedback->current_num = static_cast<std::int32_t>(found_count);
-    goal_handle->publish_feedback(feedback);
-
-    goal_running_ = false;
-    char buf[256];
-    std::snprintf(buf, sizeof(buf),
-                  "found %d/%zu classes (clusters=%zu, points=%zu, frames=%zu) %s",
-                  found_count, requested_classes.size(), clusters.size(),
-                  accumulated_cloud->points.size(), collected_clouds.size(),
-                  per_class_diag.c_str());
-    result->message = buf;
-    result->success = (found_count == static_cast<int>(requested_classes.size()));
-    goal_handle->succeed(result);
-  }
-
-  void abortGoal(const std::shared_ptr<GoalHandle> &goal_handle,
-                 const std::shared_ptr<LocalSearch::Result> &result,
-                 const std::string &message) {
-    goal_running_ = false;
-    result->success = false;
-    result->message = message;
-    goal_handle->abort(result);
+    return true;
   }
 
   std::vector<BBoxCandidate>
@@ -832,10 +1008,15 @@ private:
   double prefilter_y_max_{2.0};
   double prefilter_z_min_{-0.05};
   double prefilter_z_max_{2.0};
-  int accumulate_frames_{10};
-  double accumulate_timeout_sec_{3.0};
+  double submap_timeout_sec_{3.0};
   int cloud_queue_max_size_{60};
   double max_distance_from_reference_m_{1.0};
+  bool ekf_enabled_{true};
+  double ekf_timeout_sec_{10.0};
+  double ekf_converged_variance_{0.01};
+  double ekf_initial_variance_{1.0};
+  double ekf_measurement_variance_{0.09};
+  double ekf_process_variance_per_sec_{0.0025};
 
   std::mutex data_mutex_;
   std::condition_variable data_cv_;
