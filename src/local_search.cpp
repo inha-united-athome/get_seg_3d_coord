@@ -1017,6 +1017,8 @@ private:
   double ekf_initial_variance_{1.0};
   double ekf_measurement_variance_{0.09};
   double ekf_process_variance_per_sec_{0.0025};
+  bool ekf_log_enabled_{true};
+  std::string ekf_log_dir_{"EKF_results"};
 
   std::mutex data_mutex_;
   std::condition_variable data_cv_;

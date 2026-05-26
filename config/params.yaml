@@ -23,7 +23,7 @@ table_person_association:
 local_search:
   ros__parameters:
     mask_topic: "/sam2_segmentation_node/binary_mask/compressed"
-    pointcloud_topic: "/livox/lidar"
+    pointcloud_topic: "/approach/submap_cloud"
     camera_info_topic: "/camera/camera_head/color/camera_info"
     bbox_topic: "/detection/bbox_stream"
     odom_topic: "/odom"
@@ -62,3 +62,5 @@ local_search:
     ekf_initial_variance: 1.0
     ekf_measurement_variance: 0.09
     ekf_process_variance_per_sec: 0.0025
+    ekf_log_enabled: true
+    ekf_log_dir: "EKF_results"
